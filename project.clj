@@ -11,6 +11,7 @@
 ;                 ;...add-dependencies returns full dependency graph...
 ;                 => (require '(incanter core stats charts))
 
+                 [com.taoensso/timbre "4.10.0"]             ;; logging: https://github.com/ptaoussanis/timbre
                  ]
   :aot [hashcode2018.core]
   :main hashcode2018.core)

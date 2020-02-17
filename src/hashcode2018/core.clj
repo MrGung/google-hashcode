@@ -21,6 +21,16 @@
 (defn l [msg obj]
   (println msg obj))
 
+;; #### logging
+
+(defn configure-logging []
+  (l/set-config! l/example-config)
+  #_(l/merge-config! {:appenders
+                      {:println
+                       (taoensso.timbre.appenders.example/example-appender)
+                       ;;{:output-fn (fn [{:keys [msg_]}] (force msg_))}
+                       }}))
+
 
 ;; ## parse input
 (defn parse-line-to-integers [line]
@@ -39,42 +49,12 @@
        (zipmap
          [:#row-start :#column-start :#row-finish :#column-finish :#earliest-start :#latest-finish])))
 
-(defn parse-input [filename]
-  (with-open [rdr (clojure.java.io/reader
-                    (.getPath (clojure.java.io/resource filename)))]
-    (let [lines (line-seq rdr)
-          header (parse-header (first lines))
-          rides (doall (map parse-ride (rest lines)))]
-      {:header header
-       :rides  rides})))
-
-
-;; ## build structures
-(defn assign-rides-to-grid [rides]
-  (reduce
-    (fn [grid ride]
-      (let [coord [((juxt :#row-start :#column-start) ride)]]
-        (update-in grid
-                   coord
-                   conj
-                   ride)))
-    {}
-    rides))
-
-(defn create-cars [amount]
-  (for [car-id (range amount)]
-    {:car-id car-id
-     :rides  []
-     :tick   0}))
-
-
-;; ## magic
 ;; ### position and distance
 (defn get-start-position-ride [ride]
-  ((juxt :#row-start :#column-start) ride))
+  (:start-pos ride))
 
 (defn get-finish-position-ride [ride]
-  ((juxt :#row-finish :#column-finish) ride))
+  (:finish-pos ride))
 
 (defn get-position [car]
   (or
@@ -88,30 +68,116 @@
   (Math/abs (+ (- r1 r2) (- c1 c2))))
 
 
+;; ### augment data
+
+(defn augment-ride
+  "Augments rides with additional data. Returns nil if ride cannot be done (is invalid)."
+  [ride]
+  (let [start-pos ((juxt :#row-start :#column-start) ride)
+        finish-pos ((juxt :#row-finish :#column-finish) ride)
+        dist (dist start-pos finish-pos)
+        ]
+    (if (> dist (- (:#latest-finish ride)
+                   (:#earliest-start ride)))
+      (do
+        (l/warn "Ride cannot be done: " ride)
+        nil                                                 ;; the ride cannot be done
+        )
+      (assoc ride :dist dist
+                  :start-pos start-pos
+                  :finish-pos finish-pos))))
+
+;; ### driving the parsing
+(defn parse-input [filename]
+  (with-open [rdr (clojure.java.io/reader
+                    (.getPath (clojure.java.io/resource filename)))]
+    (let [lines (line-seq rdr)
+          header (parse-header (first lines))
+          rides (doall (->> lines
+                            rest
+                            (map (comp augment-ride parse-ride))
+                            (remove nil?)))]
+      {:header header
+       :rides  rides})))
+
+
+;; ## build structures
+(defn assign-rides-to-grid
+  "Places rides on their starting-positions in the grid."
+  [rides]
+  (reduce
+    (fn [grid ride]
+      (let [coord (:start-pos ride)]
+        (update grid
+                coord
+                conj
+                ride)))
+    {}
+    rides))
+
+(defn create-cars [amount]
+  (for [car-id (range amount)]
+    {:car-id car-id
+     :rides  []
+     :tick   0}))
+
+
+;; ## magic
 ;; ### sorting
 
 (defn sort-grid-by-distance [car-pos grid]
-  (sort-by (comp (partial dist car-pos) key) grid))
+  (sort-by (comp (partial dist car-pos) first) grid))
 
-(defn scan-grid-for-next-ride [car-pos grid]
-  (if-let [ride (some->
-                  (get grid car-pos)
-                  first)]
-    (do
-      (l/debug "found ride on car's position")
-      ride)
-    (let [sorted-grid (sort-grid-by-distance car-pos grid)]
-      (-> sorted-grid
-          first
-          first))))
+(defn scan-grid-for-next-ride
+  "Scans the grid for a next ride - takes the closest ride to a car's position."
+  [car-pos grid]
+  (let [sorted-grid (sort-grid-by-distance car-pos grid)
+        impossible-ride? (fn [ride]
+                           (< (:#latest-finish ride)
+                              (+ (dist car-pos (:start-pos ride))
+                                 (:dist ride))))
+        ;; remove rides than cannot be performed by this car from its current position
+        filtered-grid (reduce (fn [grid [coord rides]]
+                                (let [filtered-rides (remove impossible-ride? rides)]
+                                  (if (seq filtered-rides)
+                                    (assoc grid coord filtered-rides)
+                                    grid)))
+                              {}
+                              sorted-grid)]
+    ;; take the first ride from the nearest location in the grid
+    (l/spy :debug "ride from filtered-grid" (->> filtered-grid
+                                                 first
+                                                 second
+                                                 first))))
 
 ;; ### working with the grid
-(defn gc [grid ride-pos]
+;; #### clean up
+(defn gc
+  "Garbage-collects the grid: remove coords that no longer have rides associated."
+  [grid ride-pos]
   (cond-> grid
           (empty? (get grid ride-pos)) (dissoc ride-pos)))
 
-(defn find-next-ride [car grid]
-  (if-let [next-ride (scan-grid-for-next-ride (get-position car) grid)]
+(defn gc-full-grid
+  "Garbage-collect all rides that can no longer be done by any car."
+  [cars grid]
+  (let [min-tick (l/spy :debug "min-tick" (->> cars
+                                               (map :tick)
+                                               (reduce min)))]
+    (reduce (fn [m [coord rides]]
+              (let [filtered-rides (filter #(> min-tick %) rides)]
+                (if (seq filtered-rides)
+                  (assoc m coord filtered-rides)
+                  m)))
+            {}
+            grid)))
+
+
+;; #### searching and finding rides
+(defn find-next-ride
+  "Find the car's next ride - remove that ride from the grid."
+  [car grid]
+  (if-let [next-ride (l/spy :debug "next-ride from find-next-ride: " (scan-grid-for-next-ride (get-position car) grid))]
     (let [next-ride-start-pos (get-start-position-ride next-ride)
           next-ride-finish-pos (get-finish-position-ride next-ride)
           updated-grid (l/spy :debug "grid"
@@ -125,7 +191,7 @@
       nil)))
 
 (defn assign-rides
-  "Weißt den Cars die Rides in einer Runde zu."
+  "Assigns rides to cars - cars are iterated once."
   [cars grid]
   (reduce (fn [{:keys [new-grid] :as result} car]
             (if (not (empty? new-grid))
@@ -133,11 +199,16 @@
                 (l/debug "grid is not empty")
                 (if-let [{:keys [ride updated-grid]} (find-next-ride car grid)]
                   (do
-                    (l/debug (format "found next ride: %s \nfor car: %s" ride car))
-                    (let [ticks-to-add-for-car (l/spy :debug "ticks for ride" (dist (get-position car) (get-finish-position-ride ride)))
+                    (let [new-tick-of-car (l/spy :debug "ticks for ride"
+                                                 (let [getting-there (dist (get-position car) (get-start-position-ride ride))
+                                                       tick (:tick car)
+                                                       new-tick-of-car (+ (max (+ tick getting-there)
+                                                                               (:#earliest-start ride))
+                                                                          (:dist ride))]
+                                                   new-tick-of-car))
                           updated-car (l/spy :debug "updated-car: " (-> car
                                                                         (update :rides conj ride)
-                                                                        (update :tick + ticks-to-add-for-car)))
+                                                                        (assoc :tick new-tick-of-car)))
                           new-result (-> result
                                          (update :new-cars conj updated-car)
                                          (assoc :new-grid updated-grid))]
@@ -146,24 +217,22 @@
                       result)))
               (do
                 (l/info "no more rides to assign")
-                result                                      ;; bisheriges Ergebnis zurückgeben.
+                (reduced result)                            ;; bisheriges Ergebnis zurückgeben.
                 )))
           {:new-cars [] :new-grid grid}
           cars))
 
 
+(defn assign-all-rides [cars grid]
+  (if (empty? grid)
+    cars
+    (let [{:keys [new-cars new-grid]} (assign-rides cars grid)
+          new-grid (gc-full-grid new-cars new-grid)]
+      (recur new-cars new-grid))))
+
 ;; ## driver
 
-(defn configure-logging []
-  (comment (l/println-appender)
-           (taoensso.timbre.appenders.core/println-appender))
 
-  (l/set-config! #_{
-                    :timestamp-opts {}
-                    :level          :debug
-                    }
-    (assoc l/example-config
-      :timestamp-opts {})))
 
 
 (defn -main []
@@ -173,14 +242,9 @@
     (l "number of rides in input: " (count rides))
     (clojure.pprint/print-table rides)
     (let [grid (assign-rides-to-grid rides)
-          cars (create-cars (:#vehicles header))
-          ;;(p cars)
-          ;;(p grid)
-          ]
-      ;; für später
-      (let [{:keys [new-cars new-grid]} (assign-rides cars grid)]
-        (p "cars: " new-cars)
-        )
+          cars (create-cars (:#vehicles header))]
+      (let [new-cars (assign-all-rides cars grid)]
+        (p "cars: " new-cars))
 
 
       ;;(let [car (first cars)
